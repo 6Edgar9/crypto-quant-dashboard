@@ -41,8 +41,14 @@ if 'resumen_df' not in st.session_state:
 with st.sidebar:
     st.header("⚙️ Parámetros")
     monedas_mercado = obtener_monedas_mercado()
-    monedas_seleccionadas = st.multiselect("Selecciona Criptomonedas:", monedas_mercado, default=["BTC", "ETH", "BNB"])
-    fecha_inicio = st.date_input("Fecha de inicio:", datetime.date(2023, 1, 1))
+    
+    # NUEVO: Multiselect vacío por defecto
+    monedas_seleccionadas = st.multiselect("Selecciona Criptomonedas:", monedas_mercado, default=[])
+    
+    # NUEVO: Fecha dinámica seteada al día 1 del mes actual
+    hoy = datetime.date.today()
+    primer_dia_mes = hoy.replace(day=1)
+    fecha_inicio = st.date_input("Fecha de inicio:", value=primer_dia_mes)
     
     btn_analizar = st.button("🚀 Analizar Datos", use_container_width=True, type="primary")
 
@@ -52,7 +58,8 @@ if btn_analizar:
         st.sidebar.error("Selecciona al menos una moneda.")
     else:
         with st.spinner("Descargando y procesando datos del mercado..."):
-            fecha_amortiguada = fecha_inicio - datetime.timedelta(days=80)
+            # NUEVO: 100 días de colchón para evitar el error de "Datos insuficientes" en YF
+            fecha_amortiguada = fecha_inicio - datetime.timedelta(days=100)
             datos_resumen = []
             st.session_state.datos_procesados.clear()
             
@@ -64,11 +71,17 @@ if btn_analizar:
                     st.toast(f"⚠️ Datos insuficientes para {cripto}")
                     continue
                 
+                # NUEVO: Limpiamos la zona horaria del índice para evitar errores de filtrado de pandas
+                df.index = df.index.tz_localize(None)
+                
                 df['SMA_50'] = calcular_sma(df['Close'], 50)
                 df['EMA_21'] = calcular_ema(df['Close'], 21)
                 df['RSI_14'] = calcular_rsi(df['Close'], 14)
                 
-                df_filtrado = df.loc[fecha_inicio.strftime('%Y-%m-%d'):]
+                # Filtrado seguro convirtiendo el input a datetime
+                fecha_inicio_dt = pd.to_datetime(fecha_inicio)
+                df_filtrado = df.loc[fecha_inicio_dt:]
+                
                 if df_filtrado.empty: continue
                 
                 st.session_state.datos_procesados[cripto] = df_filtrado
@@ -87,7 +100,10 @@ if btn_analizar:
                     'Tendencia': "📈 Alcista" if p_actual > sma_act else "📉 Bajista"
                 })
             
-            st.session_state.resumen_df = pd.DataFrame(datos_resumen)
+            if datos_resumen:
+                st.session_state.resumen_df = pd.DataFrame(datos_resumen)
+            else:
+                st.sidebar.error("Ninguna moneda tuvo datos suficientes. Intenta otra fecha.")
 
 # --- INTERFAZ PRINCIPAL (TABS) ---
 if not st.session_state.datos_procesados:
