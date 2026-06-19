@@ -3,6 +3,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import datetime
+import time
 import requests
 
 # --- CONFIGURACIÓN DE LA PÁGINA ---
@@ -13,8 +14,10 @@ st.title("📈 Panel de Análisis Cripto Cuantitativo")
 @st.cache_data(ttl=3600) # Cache de 1 hora para no saturar la API
 def obtener_monedas_mercado():
     try:
-        resp = requests.get("https://api.binance.com/api/v3/ticker/price", timeout=5)
-        monedas = [item['symbol'].replace('USDT', '') for item in resp.json() if item['symbol'].endswith('USDT')]
+        # Extraemos la lista oficial de KuCoin (Sin bloqueo de IP para USA)
+        resp = requests.get("https://api.kucoin.com/api/v2/symbols", timeout=5)
+        data = resp.json()
+        monedas = [item['baseCurrency'] for item in data['data'] if item['quoteCurrency'] == 'USDT' and item['enableTrading']]
         return sorted(list(set(monedas)))
     except:
         return ['BTC', 'ETH', 'BNB', 'SOL', 'XRP', 'ADA', 'DOGE']
@@ -41,7 +44,6 @@ with st.sidebar:
     st.header("⚙️ Parámetros")
     monedas_mercado = obtener_monedas_mercado()
     
-    # Multiselect vacío por defecto (para que no procese nada al abrir)
     monedas_seleccionadas = st.multiselect("Selecciona Criptomonedas:", monedas_mercado, default=[])
     
     # Fecha dinámica seteada al día 1 del mes actual automáticamente
@@ -51,36 +53,50 @@ with st.sidebar:
     
     btn_analizar = st.button("🚀 Analizar Datos", use_container_width=True, type="primary")
 
-# --- LÓGICA DE EXTRACCIÓN (NUEVO MOTOR BINANCE) ---
+# --- LÓGICA DE EXTRACCIÓN (NUEVO MOTOR KUCOIN) ---
 if btn_analizar:
     if not monedas_seleccionadas:
         st.sidebar.error("Selecciona al menos una moneda.")
     else:
-        with st.spinner("Descargando datos históricos directamente del Exchange..."):
+        with st.spinner("Descargando datos históricos del Exchange (Anti-Bloqueos)..."):
+            # Pedimos 100 días de colchón para que el SMA y el RSI nazcan calculados
+            fecha_amortiguada = fecha_inicio - datetime.timedelta(days=100)
+            start_ts = int(time.mktime(fecha_amortiguada.timetuple()))
+            
             datos_resumen = []
             st.session_state.datos_procesados.clear()
             
             for cripto in monedas_seleccionadas:
-                # Extraemos hasta 1000 días de historia (~3 años) asegurando datos suficientes siempre
-                url = f"https://api.binance.com/api/v3/klines?symbol={cripto}USDT&interval=1d&limit=1000"
-                resp = requests.get(url, timeout=5)
+                # Endpoint de KuCoin seguro para la nube
+                url = f"https://api.kucoin.com/api/v1/market/candles?type=1day&symbol={cripto}-USDT&startAt={start_ts}"
+                
+                # Simulamos ser un navegador común para evitar cualquier filtro
+                headers = {'User-Agent': 'Mozilla/5.0'}
+                resp = requests.get(url, headers=headers, timeout=10)
                 
                 if resp.status_code != 200:
-                    st.toast(f"⚠️ El exchange no devolvió datos para {cripto}")
+                    st.toast(f"⚠️ Error de conexión con el exchange para {cripto}")
                     continue
                     
                 data = resp.json()
+                if data.get('code') != '200000' or not data.get('data'):
+                    st.toast(f"⚠️ Sin datos históricos en este exchange para {cripto}")
+                    continue
                 
-                # Transformamos la data cruda de Binance en el DataFrame que nuestras gráficas ya entienden
-                df = pd.DataFrame(data, columns=['timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'])
-                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                # KuCoin devuelve: [timestamp, open, close, high, low, volume, turnover]
+                df = pd.DataFrame(data['data'], columns=['timestamp', 'Open', 'Close', 'High', 'Low', 'Volume', 'Turnover'])
+                
+                # KuCoin entrega los datos al revés (del más nuevo al más viejo). Los invertimos.
+                df = df.iloc[::-1].reset_index(drop=True)
+                
+                df['timestamp'] = pd.to_datetime(df['timestamp'].astype(int), unit='s')
                 df.set_index('timestamp', inplace=True)
                 
                 for col in ['Open', 'High', 'Low', 'Close']:
                     df[col] = df[col].astype(float)
                 
                 if df.empty or len(df) < 50:
-                    st.toast(f"⚠️ Historial muy corto para {cripto}")
+                    st.toast(f"⚠️ Historial insuficiente para calcular RSI en {cripto}")
                     continue
                 
                 # Inyección de Indicadores Técnicos
@@ -88,17 +104,16 @@ if btn_analizar:
                 df['EMA_21'] = calcular_ema(df['Close'], 21)
                 df['RSI_14'] = calcular_rsi(df['Close'], 14)
                 
-                # Filtramos el DataFrame exacto desde la fecha que pusiste en el calendario
+                # Filtramos para mostrar desde el día que elegiste en el calendario
                 fecha_inicio_dt = pd.to_datetime(fecha_inicio)
                 df_filtrado = df.loc[fecha_inicio_dt:]
                 
                 if df_filtrado.empty: 
-                    st.toast(f"⚠️ Sin datos recientes para {cripto} desde {fecha_inicio}")
+                    st.toast(f"⚠️ No hay datos recientes desde tu fecha para {cripto}")
                     continue
                 
                 st.session_state.datos_procesados[cripto] = df_filtrado
                 
-                # Extracción de métricas
                 p_actual = df_filtrado['Close'].iloc[-1]
                 p_max = df_filtrado['High'].max()
                 rsi_act = df_filtrado['RSI_14'].iloc[-1]
@@ -106,7 +121,7 @@ if btn_analizar:
                 
                 datos_resumen.append({
                     'Moneda': cripto,
-                    'Precio ($)': round(p_actual, 2),
+                    'Precio ($)': round(p_actual, 4),
                     'RSI (14d)': round(rsi_act, 2),
                     'Estado': "🔴 Sobrecompra" if rsi_act > 70 else ("🟢 Sobreventa" if rsi_act < 30 else "Neutral"),
                     'Caída vs Máx (%)': f"{round(((p_max - p_actual)/p_max)*100, 2)}%",
@@ -116,7 +131,7 @@ if btn_analizar:
             if datos_resumen:
                 st.session_state.resumen_df = pd.DataFrame(datos_resumen)
             else:
-                st.sidebar.error("Ninguna moneda tuvo datos suficientes. Intenta otra fecha o activo.")
+                st.sidebar.error("Ninguna moneda tuvo datos suficientes. Intenta otra fecha.")
 
 # --- INTERFAZ PRINCIPAL (TABS) ---
 if not st.session_state.datos_procesados:
@@ -163,8 +178,8 @@ else:
             
             st.success(f"### Resultados para {sim_moneda}")
             c1, c2, c3 = st.columns(3)
-            c1.metric("Compraste en (Mínimo)", f"${p_min:,.2f}")
-            c2.metric("Vendiste en (Máximo)", f"${p_max:,.2f}")
+            c1.metric("Compraste en (Mínimo)", f"${p_min:,.4f}")
+            c2.metric("Vendiste en (Máximo)", f"${p_max:,.4f}")
             c3.metric("Ganancia Neta", f"${ganancia:,.2f}", f"+{((ganancia/usdt_inicial)*100):.2f}%")
 
     # PESTAÑA 3: ALERTAS
@@ -175,8 +190,8 @@ else:
         
         p_actual_al = st.session_state.datos_procesados[alerta_moneda]['Close'].iloc[-1]
         
-        p_compra = colB.number_input("Comprar si cae a:", value=float(round(p_actual_al * 0.90, 2)), step=1.0)
-        p_venta = colC.number_input("Vender si sube a:", value=float(round(p_actual_al * 1.20, 2)), step=1.0)
+        p_compra = colB.number_input("Comprar si cae a:", value=float(round(p_actual_al * 0.90, 4)), step=1.0)
+        p_venta = colC.number_input("Vender si sube a:", value=float(round(p_actual_al * 1.20, 4)), step=1.0)
         
         if st.button("Evaluar Estrategia"):
             if p_compra >= p_venta:
@@ -186,7 +201,7 @@ else:
                 dist_venta = ((p_venta - p_actual_al) / p_actual_al) * 100
                 rrr = (p_venta - p_actual_al) / (p_actual_al - p_compra) if (p_actual_al - p_compra) > 0 else 0
                 
-                st.write(f"**Precio Actual:** ${p_actual_al:,.2f}")
+                st.write(f"**Precio Actual:** ${p_actual_al:,.4f}")
                 st.write(f"**Distancia a Compra:** Caída del {dist_compra:.2f}% | **Distancia a Venta:** Subida del {dist_venta:.2f}%")
                 st.write(f"**Ratio Riesgo/Beneficio:** 1 : {rrr:.2f}")
                 
