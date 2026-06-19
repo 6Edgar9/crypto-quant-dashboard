@@ -1,5 +1,4 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -42,50 +41,64 @@ with st.sidebar:
     st.header("⚙️ Parámetros")
     monedas_mercado = obtener_monedas_mercado()
     
-    # NUEVO: Multiselect vacío por defecto
+    # Multiselect vacío por defecto (para que no procese nada al abrir)
     monedas_seleccionadas = st.multiselect("Selecciona Criptomonedas:", monedas_mercado, default=[])
     
-    # NUEVO: Fecha dinámica seteada al día 1 del mes actual
+    # Fecha dinámica seteada al día 1 del mes actual automáticamente
     hoy = datetime.date.today()
     primer_dia_mes = hoy.replace(day=1)
     fecha_inicio = st.date_input("Fecha de inicio:", value=primer_dia_mes)
     
     btn_analizar = st.button("🚀 Analizar Datos", use_container_width=True, type="primary")
 
-# --- LÓGICA DE EXTRACCIÓN ---
+# --- LÓGICA DE EXTRACCIÓN (NUEVO MOTOR BINANCE) ---
 if btn_analizar:
     if not monedas_seleccionadas:
         st.sidebar.error("Selecciona al menos una moneda.")
     else:
-        with st.spinner("Descargando y procesando datos del mercado..."):
-            # NUEVO: 100 días de colchón para evitar el error de "Datos insuficientes" en YF
-            fecha_amortiguada = fecha_inicio - datetime.timedelta(days=100)
+        with st.spinner("Descargando datos históricos directamente del Exchange..."):
             datos_resumen = []
             st.session_state.datos_procesados.clear()
             
             for cripto in monedas_seleccionadas:
-                ticker_symbol = f"{cripto}-USD"
-                df = yf.Ticker(ticker_symbol).history(start=fecha_amortiguada.strftime('%Y-%m-%d'))
+                # Extraemos hasta 1000 días de historia (~3 años) asegurando datos suficientes siempre
+                url = f"https://api.binance.com/api/v3/klines?symbol={cripto}USDT&interval=1d&limit=1000"
+                resp = requests.get(url, timeout=5)
+                
+                if resp.status_code != 200:
+                    st.toast(f"⚠️ El exchange no devolvió datos para {cripto}")
+                    continue
+                    
+                data = resp.json()
+                
+                # Transformamos la data cruda de Binance en el DataFrame que nuestras gráficas ya entienden
+                df = pd.DataFrame(data, columns=['timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'])
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                df.set_index('timestamp', inplace=True)
+                
+                for col in ['Open', 'High', 'Low', 'Close']:
+                    df[col] = df[col].astype(float)
                 
                 if df.empty or len(df) < 50:
-                    st.toast(f"⚠️ Datos insuficientes para {cripto}")
+                    st.toast(f"⚠️ Historial muy corto para {cripto}")
                     continue
                 
-                # NUEVO: Limpiamos la zona horaria del índice para evitar errores de filtrado de pandas
-                df.index = df.index.tz_localize(None)
-                
+                # Inyección de Indicadores Técnicos
                 df['SMA_50'] = calcular_sma(df['Close'], 50)
                 df['EMA_21'] = calcular_ema(df['Close'], 21)
                 df['RSI_14'] = calcular_rsi(df['Close'], 14)
                 
-                # Filtrado seguro convirtiendo el input a datetime
+                # Filtramos el DataFrame exacto desde la fecha que pusiste en el calendario
                 fecha_inicio_dt = pd.to_datetime(fecha_inicio)
                 df_filtrado = df.loc[fecha_inicio_dt:]
                 
-                if df_filtrado.empty: continue
+                if df_filtrado.empty: 
+                    st.toast(f"⚠️ Sin datos recientes para {cripto} desde {fecha_inicio}")
+                    continue
                 
                 st.session_state.datos_procesados[cripto] = df_filtrado
                 
+                # Extracción de métricas
                 p_actual = df_filtrado['Close'].iloc[-1]
                 p_max = df_filtrado['High'].max()
                 rsi_act = df_filtrado['RSI_14'].iloc[-1]
@@ -103,7 +116,7 @@ if btn_analizar:
             if datos_resumen:
                 st.session_state.resumen_df = pd.DataFrame(datos_resumen)
             else:
-                st.sidebar.error("Ninguna moneda tuvo datos suficientes. Intenta otra fecha.")
+                st.sidebar.error("Ninguna moneda tuvo datos suficientes. Intenta otra fecha o activo.")
 
 # --- INTERFAZ PRINCIPAL (TABS) ---
 if not st.session_state.datos_procesados:
